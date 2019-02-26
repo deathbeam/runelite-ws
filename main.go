@@ -4,13 +4,61 @@ import (
 	"flag"
 	"log"
 	"net/http"
+
+	"github.com/go-redis/redis"
+	"github.com/gorilla/websocket"
 )
-import "github.com/gorilla/websocket"
-import "github.com/go-redis/redis"
 
 type Handshake struct {
-	msgType string `json:"type"`
-	session string `json:"session"`
+	MsgType string `json:"type"`
+	Session string `json:"session"`
+	Party   bool   `json:"_party"`
+}
+
+func redisWatcher(clients map[*websocket.Conn]string, sessionSubChannel <-chan *redis.Message) {
+	for {
+		for msg := range sessionSubChannel {
+			uuid := msg.Channel[8:len(msg.Channel)]
+			log.Printf("received message from %v: %v\n", uuid, msg.Payload)
+
+			for client, clientUuid := range clients {
+				if uuid != clientUuid {
+					continue
+				}
+
+				if err := client.WriteMessage(websocket.TextMessage, []byte(msg.Payload)); err != nil {
+					log.Printf("failed to send message to %v: %v\n", uuid, err)
+				}
+
+				log.Printf("sent message to %v: %v", uuid, msg.Payload)
+
+				client.SetCloseHandler(func(code int, text string) error {
+					delete(clients, client)
+					return nil
+				})
+			}
+		}
+	}
+}
+
+func wsWatcher(clients map[*websocket.Conn]string, ws *websocket.Conn) {
+	// Close websocket after watcher ends
+	defer ws.Close()
+
+	// Make sure we close the connection when the function returns
+	for {
+		var msg Handshake
+
+		// Read in a new message as JSON and try to map it to a Handshake object
+		err := ws.ReadJSON(&msg)
+		if err != nil {
+			log.Printf("got error while reading ws message %v\n", err)
+			break
+		}
+
+		log.Printf("client connected: %v\n", msg)
+		clients[ws] = msg.Session
+	}
 }
 
 func main() {
@@ -40,57 +88,32 @@ func main() {
 		log.Fatalf("failed to create subscription for session.*: %v", err)
 	}
 
+	log.Printf("connected to redis %v\n", *redisAddr)
+
 	// Go channel which receives messages.
 	sessionSubChannel := sessionSub.Channel()
 
-	// Start listening
-	go func() {
-		for {
-			for msg := range sessionSubChannel {
-				uuid := msg.Channel[8:len(msg.Channel)]
-				log.Printf("received message from %v: %v", uuid, msg.Payload)
+	// Start listening for redis messages
+	go redisWatcher(clients, sessionSubChannel)
 
-				for client, clientUuid := range clients {
-					if uuid != clientUuid {
-						continue
-					}
-
-					if err := client.WriteMessage(websocket.TextMessage, []byte(msg.Payload)); err != nil {
-						log.Printf("failed to send message to %v: %v", uuid, err)
-					}
-				}
-			}
-		}
-	}()
-
+	// Create ws service
 	upgrader := websocket.Upgrader{}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// Get ws connection from request
 		ws, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Fatalf("unable to create websocket: %v", err)
+			log.Printf("unable to create websocket: %v\n", err)
 		}
 
-		// Make sure we close the connection when the function returns
-		for {
-			var msg Handshake
+		log.Printf("got ws connection from %v\n", ws.RemoteAddr())
 
-			// Read in a new message as JSON and try to map it to a Handshake object
-			err := ws.ReadJSON(&msg)
-			if err != nil {
-				delete(clients, ws)
-				break
-			}
-
-			log.Printf("client connected: %v\n", msg.session)
-			clients[ws] = msg.session
-		}
+		// Start listening for websocket messages
+		go wsWatcher(clients, ws)
 	})
 
+	log.Printf("starting http server on %v\n", *listenAddr)
 	if err := http.ListenAndServe(*listenAddr, nil); err != nil {
 		log.Fatalf("unable to start http server: %v", err)
 	}
-
-	log.Printf("http server started on %v\n", listenAddr)
 }
