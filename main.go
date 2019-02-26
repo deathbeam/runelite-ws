@@ -31,11 +31,6 @@ func redisWatcher(clients map[*websocket.Conn]string, sessionSubChannel <-chan *
 				}
 
 				log.Printf("sent message to %v: %v", uuid, msg.Payload)
-
-				client.SetCloseHandler(func(code int, text string) error {
-					delete(clients, client)
-					return nil
-				})
 			}
 		}
 	}
@@ -58,6 +53,10 @@ func wsWatcher(clients map[*websocket.Conn]string, ws *websocket.Conn) {
 
 		log.Printf("client connected: %v\n", msg)
 		clients[ws] = msg.Session
+		ws.SetCloseHandler(func(code int, text string) error {
+			delete(clients, ws)
+			return nil
+		})
 	}
 }
 
